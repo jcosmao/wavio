@@ -52,6 +52,10 @@ const mockNative = {
   search: jest.fn(async (): Promise<unknown[]> => []),
   connect: jest.fn(async () => true),
   load: jest.fn(loadOk),
+  setNext: jest.fn(async () => ({
+    ok: true,
+    errorCode: null as number | null,
+  })),
   play: jest.fn(async () => true),
   pause: jest.fn(async () => ({ ok: true, stoppedInstead: false })),
   seek: jest.fn(async () => true),
@@ -198,6 +202,10 @@ const moveQueueTo = (index: number) => {
 };
 jest.mock("@/stores/queue", () => ({
   __esModule: true,
+  peekNextTrack: () =>
+    mockQueueState.currentIndex == null
+      ? null
+      : (mockQueueState.queue[mockQueueState.currentIndex + 1] ?? null),
   default: {
     getState: () => mockQueueState,
     subscribe: jest.fn((cb: (state: typeof mockQueueState) => void) => {
@@ -272,6 +280,9 @@ beforeEach(async () => {
   mockNative.search.mockResolvedValue([]);
   mockNative.connect.mockResolvedValue(true);
   mockNative.load.mockImplementation(loadOk);
+  // Off unless a test is about it: a queued next track changes how a STOPPED
+  // at the end of a track is read.
+  mockNative.setNext.mockResolvedValue({ ok: false, errorCode: null });
   mockNative.play.mockResolvedValue(true);
   mockNative.pause.mockResolvedValue({ ok: true, stoppedInstead: false });
   mockNative.seek.mockResolvedValue(true);
@@ -612,6 +623,114 @@ describe("what the renderer is told to fetch", () => {
   });
 });
 
+describe("handing the next track to the renderer", () => {
+  const T2_URL = "http://server/rest/stream?id=t2&u=x&t=y&s=z";
+  const lastLoadedUrl = () =>
+    (mockNative.load.mock.calls.at(-1) as unknown[] | undefined)?.[0] as string;
+  beforeEach(() => {
+    mockNative.setNext.mockResolvedValue({ ok: true, errorCode: null });
+  });
+  const advanceQueueOnNext = () =>
+    mockQueueState.next.mockImplementation(() =>
+      moveQueueTo((mockQueueState.currentIndex ?? 0) + 1),
+    );
+
+  it("queues the next track once the current one is loaded", async () => {
+    await connect();
+    await settle();
+    expect(mockNative.setNext).toHaveBeenCalledTimes(1);
+    const [url, , generation] = mockNative.setNext.mock.calls[0] as unknown[];
+    expect(url).toContain("id=t2");
+    expect(generation).toBe(lastLoadGeneration());
+  });
+
+  it("follows the renderer onto the queued track without reloading it", async () => {
+    await connect();
+    await settle();
+    advanceQueueOnNext();
+    const loads = mockNative.load.mock.calls.length;
+    push("PLAYING", 95, 100);
+    push("PLAYING", 1, 100, { trackUri: T2_URL });
+    await settle();
+    expect(mockQueueState.next).toHaveBeenCalledTimes(1);
+    expect(mockQueueState.currentIndex).toBe(1);
+    expect(mockNative.load.mock.calls.length).toBe(loads);
+    expect(activeRemoteTarget()?.readSnapshot().playing).toBe(true);
+  });
+
+  it("queues the following track only once after the renderer chained", async () => {
+    mockQueueState.queue = [
+      TRACK,
+      { id: "t2", duration: 100 },
+      { id: "t3", duration: 100 },
+    ];
+    mockQueueState.currentIndex = 0;
+    mockQueueState.repeatMode = "off";
+    await upnpConnect(device);
+    await settle();
+    advanceQueueOnNext();
+    push("PLAYING", 1, 100, { trackUri: T2_URL });
+    await settle();
+    expect(mockNative.setNext).toHaveBeenCalledTimes(2);
+    expect(mockNative.setNext.mock.calls[1]?.[0]).toContain("id=t3");
+  });
+
+  it("does not queue another track when the queue changes after the handover", async () => {
+    await connect();
+    await settle();
+    mockQueueState.queue = [TRACK, { id: "t9", duration: 100 }];
+    for (const cb of mockQueueSubscribers) cb(mockQueueState);
+    await settle();
+    expect(mockNative.setNext).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the queue's track when it moved elsewhere since the handover", async () => {
+    mockQueueState.queue = [
+      TRACK,
+      { id: "t2", duration: 100 },
+      { id: "t3", duration: 100 },
+    ];
+    mockQueueState.currentIndex = 0;
+    mockQueueState.repeatMode = "off";
+    await upnpConnect(device);
+    await settle();
+    mockQueueState.next.mockImplementation(() => moveQueueTo(2));
+    push("PLAYING", 1, 100, { trackUri: T2_URL });
+    await settle();
+    expect(lastLoadedUrl()).toContain("id=t3");
+  });
+
+  it("gives the renderer time to start the queued track before advancing itself", async () => {
+    await connect();
+    await settle();
+    const now = jest.spyOn(Date, "now");
+    try {
+      const start = Date.now();
+      now.mockReturnValue(start);
+      push("PLAYING", 95, 100);
+      push("STOPPED", 95, 100);
+      expect(mockQueueState.next).not.toHaveBeenCalled();
+      now.mockReturnValue(start + 5000);
+      push("STOPPED", 95, 100);
+      expect(mockQueueState.next).toHaveBeenCalledTimes(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("stops asking a renderer that has no SetNextAVTransportURI", async () => {
+    mockNative.setNext.mockResolvedValue({ ok: false, errorCode: 401 });
+    await connect();
+    await settle();
+    expect(mockNative.setNext).toHaveBeenCalledTimes(1);
+    moveQueueTo(0);
+    mockQueueState.queue = [...mockQueueState.queue, { id: "t3" }];
+    for (const cb of mockQueueSubscribers) cb(mockQueueState);
+    await settle();
+    expect(mockNative.setNext).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("end-of-track inference", () => {
   it("advances the queue when a played-through track stops near the end", async () => {
     await connect();
@@ -644,6 +763,39 @@ describe("end-of-track inference", () => {
     push("PLAYING", 30, 100);
     push("STOPPED", 30, 100);
     expect(mockQueueState.next).not.toHaveBeenCalled();
+  });
+
+  it("advances when the track ended while polls were not landing", async () => {
+    // Android freezes a backgrounded app for a minute or more at a time, so the
+    // last report can be from long before the end. The track played on meanwhile:
+    // the STOPPED that greets the app when it thaws is the track finishing.
+    await connect();
+    const now = jest.spyOn(Date, "now");
+    try {
+      const start = Date.now();
+      now.mockReturnValue(start);
+      push("PLAYING", 30, 100);
+      now.mockReturnValue(start + 80_000);
+      push("STOPPED", 0, 100);
+      expect(mockQueueState.next).toHaveBeenCalledTimes(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("does not advance after a poll gap too short to reach the end", async () => {
+    await connect();
+    const now = jest.spyOn(Date, "now");
+    try {
+      const start = Date.now();
+      now.mockReturnValue(start);
+      push("PLAYING", 30, 100);
+      now.mockReturnValue(start + 20_000);
+      push("STOPPED", 0, 100);
+      expect(mockQueueState.next).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("shows a track stopped from the renderer's own remote as paused where it was", async () => {

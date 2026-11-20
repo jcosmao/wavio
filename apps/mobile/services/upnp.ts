@@ -34,7 +34,7 @@ import {
 import { upnpTrace } from "@/services/upnpTrace";
 import { registerLogoutHandler, useAuthBase } from "@/stores/auth";
 import useJukebox from "@/stores/jukebox";
-import useQueue, { type QueueTrack } from "@/stores/queue";
+import useQueue, { peekNextTrack, type QueueTrack } from "@/stores/queue";
 import useUpnp, { type UpnpPersistedSession, useUpnpBase } from "@/stores/upnp";
 
 // Long enough for the slow ones — a TV waking up takes several seconds to
@@ -71,6 +71,22 @@ let wasPlaying = false;
 let pausedByUs = false;
 let finishedFired = false;
 let errorFired = false;
+
+// The track queued on the renderer with SetNextAVTransportURI. The renderer
+// starts it by itself when the current one ends, so the queue keeps playing
+// while Android has the app frozen; the app catches up when it next sees the
+// renderer holding it.
+let nextHanded: { track: QueueTrack; url: string } | null = null;
+// Kodi appends every SetNextAVTransportURI to its playlist instead of replacing
+// the queued track, so it is sent once per current track and never twice at
+// once. A queue that changes afterwards is caught when the renderer chains (see
+// adoptChainedTrack).
+let handingNext = false;
+let setNextUnsupported = false;
+// A renderer moving to the queued track can report STOPPED in between. Held
+// off this long before the app advances by itself, which would restart it.
+let stoppedNearEndSince = 0;
+const CHAIN_GRACE_MS = 4000;
 
 // Numbers every load, and is what a poll's report is checked against: the native
 // side stamps each report with the load whose track the renderer held when it was
@@ -122,6 +138,8 @@ function resetPlaybackState(positionSec: number, duration: number) {
   finishedFired = false;
   errorFired = false;
   resumeAtSec = null;
+  nextHanded = null;
+  stoppedNearEndSince = 0;
   rebase(positionSec);
 }
 
@@ -155,6 +173,17 @@ function onNativeState(state: UpnpState) {
   // A renderer that says what it holds is only believed about our track when it
   // names it. Between tracks some go on reporting the previous one for a poll
   // or two, and that one ending is old news.
+  if (
+    nextHanded &&
+    state.trackUri &&
+    sameStreamUri(state.trackUri, nextHanded.url) &&
+    !sameStreamUri(state.trackUri, loadedTrackUri)
+  ) {
+    adoptChainedTrack(nextHanded, state, position);
+    notifyChange();
+    return;
+  }
+
   const aboutOurTrack =
     !state.trackUri ||
     !loadedTrackUri ||
@@ -179,6 +208,7 @@ function onNativeState(state: UpnpState) {
       wasPlaying = true;
       pausedByUs = false;
       finishedFired = false;
+      stoppedNearEndSince = 0;
       // Whatever we meant to seek back to, the renderer is playing from where it
       // is now; a resume left pending here would make every later seek wait for
       // a Play that is not coming.
@@ -200,6 +230,10 @@ function onNativeState(state: UpnpState) {
     case "NO_MEDIA_PRESENT":
       if (!aboutOurTrack || loading || !wasPlaying || pausedByUs) break;
       if (!finishedFired && nearEnd()) {
+        if (nextHanded) {
+          stoppedNearEndSince ||= Date.now();
+          if (Date.now() - stoppedNearEndSince < CHAIN_GRACE_MS) break;
+        }
         finishedFired = true;
         wasPlaying = false;
         advanceAfterTrackEnd();
@@ -228,11 +262,108 @@ function onNativeState(state: UpnpState) {
  *
  * With no known duration there is nothing to compare against, so trust that we
  * were playing: advancing beats stalling.
+ *
+ * The last position seen is carried forward by the time since it was seen:
+ * Android freezes a backgrounded app for a minute or more at a time, and the
+ * report that greets it on waking can be the first since long before the end.
  */
 function nearEnd(): boolean {
   if (lastDurationSec <= 0) return true;
   const window = Math.max(5, lastDurationSec * 0.1);
-  return lastPositionSec >= lastDurationSec - window;
+  const reached = Math.max(lastPositionSec, interpolatedPosition());
+  return reached >= lastDurationSec - window;
+}
+
+/**
+ * The renderer moved on to the track queued with SetNextAVTransportURI. The queue
+ * follows without a reload, which would restart the track from the top. If the
+ * queue lands somewhere else (it changed since the track was queued), that track
+ * is loaded instead.
+ */
+function adoptChainedTrack(
+  handed: { track: QueueTrack; url: string },
+  state: UpnpState,
+  position: number,
+) {
+  upnpTrace(() => `renderer chained to ${handed.track.id}`);
+  nextHanded = null;
+  lastPushedTrackId = handed.track.id;
+  let stopped = false;
+  advanceQueueAfterTrackEnd({
+    reload: () => {},
+    stop: () => {
+      stopped = true;
+    },
+  });
+  consumeAutomaticAdvance();
+
+  loadedTrackUri = handed.url;
+  resetPlaybackState(position, handed.track.duration ?? 0);
+  loading = false;
+  if (stopped) {
+    pausedByUs = true;
+    void Native?.pause();
+    return;
+  }
+  const current = useQueue.getState().getCurrent();
+  if (current?.id !== handed.track.id) {
+    lastPushedTrackId = current?.id ?? null;
+    if (current) {
+      void loadOnRenderer(current, true, 0, { automatic: true });
+    } else {
+      pausedByUs = true;
+      void Native?.pause();
+    }
+    return;
+  }
+  wasPlaying =
+    state.playbackState === "PLAYING" ||
+    state.playbackState === "TRANSITIONING";
+  rememberTrack(handed.track.id, handed.url);
+  noteRemoteLoadSucceeded();
+  void handNextToRenderer();
+}
+
+/** Queues the track after the current one on the renderer, when there is one. */
+async function handNextToRenderer() {
+  if (!Native?.setNext || setNextUnsupported || !isUpnpConnected() || loading) {
+    return;
+  }
+  if (nextHanded || handingNext) return;
+  const current = useQueue.getState().getCurrent();
+  const next = peekNextTrack();
+  if (!current || !next || next.id === current.id) return;
+  if (current.isRadio || next.isRadio || isAudiobookTrack(next)) return;
+  const url = castContentUrl(next);
+  if (!url || url.startsWith("file://")) return;
+  const generation = currentGeneration;
+  handingNext = true;
+  try {
+    const result = await Native.setNext(url, renderInfo(next, url), generation);
+    if (generation !== currentGeneration) return;
+    if (result.ok) {
+      nextHanded = { track: next, url };
+    } else if (result.errorCode === 401 || result.errorCode === 602) {
+      setNextUnsupported = true;
+    }
+  } catch (error) {
+    reportError(error, { area: "player", endpoint: "upnp.setNext" });
+  } finally {
+    handingNext = false;
+  }
+}
+
+function renderInfo(track: QueueTrack, url: string) {
+  return {
+    mime: castMime(track, url),
+    title: track.title ?? "",
+    artist: track.artist,
+    album: track.album,
+    // Only an address the renderer can reach: a cached cover lives on this
+    // phone and would render as a broken image on the device.
+    artworkUrl: track.artwork?.startsWith("http") ? track.artwork : undefined,
+    durationSec: track.duration,
+  };
 }
 
 function advanceAfterTrackEnd() {
@@ -311,18 +442,7 @@ async function loadOnRenderer(
   try {
     const result = await Native.load(
       url,
-      {
-        mime: castMime(track, url),
-        title: track.title ?? "",
-        artist: track.artist,
-        album: track.album,
-        // Only an address the renderer can reach: a cached cover lives on this
-        // phone and would render as a broken image on the device.
-        artworkUrl: track.artwork?.startsWith("http")
-          ? track.artwork
-          : undefined,
-        durationSec: track.duration,
-      },
+      renderInfo(track, url),
       autoplay,
       autoplay ? Math.round(startSeconds * 1000) : 0,
       generation,
@@ -362,6 +482,7 @@ async function loadOnRenderer(
     noteRemoteLoadSucceeded();
     rememberTrack(track.id, url);
     notifyChange();
+    if (autoplay) void handNextToRenderer();
     return true;
   } catch (error) {
     upnpTrace(`load #${generation} threw: ${String(error)}`);
@@ -393,7 +514,10 @@ function subscribeQueue() {
     const current =
       state.currentIndex != null ? state.queue[state.currentIndex] : null;
     const id = current?.id ?? null;
-    if (id === lastPushedTrackId) return;
+    if (id === lastPushedTrackId) {
+      void handNextToRenderer();
+      return;
+    }
     lastPushedTrackId = id;
     const automatic = consumeAutomaticAdvance();
     if (!current) {
@@ -562,6 +686,7 @@ function attach(
   track: Pick<UpnpPersistedSession, "trackId" | "trackUrl">,
 ) {
   if (!Native) return;
+  setNextUnsupported = false;
   stateSubscription?.remove();
   stateSubscription = Native.addListener("state", onNativeState);
   lostSubscription?.remove();

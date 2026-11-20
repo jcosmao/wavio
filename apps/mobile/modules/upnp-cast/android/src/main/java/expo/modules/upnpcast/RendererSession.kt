@@ -76,6 +76,10 @@ class RendererSession(
   @Volatile
   private var lastUri: String? = null
 
+  /** Handed over with SetNextAVTransportURI, until the renderer reports playing it. */
+  @Volatile
+  private var nextUri: String? = null
+
   @Volatile
   private var lastTransportState: String? = null
 
@@ -113,6 +117,7 @@ class RendererSession(
     activeGeneration = 0.0
     latestRequested = 0.0
     lastUri = null
+    nextUri = null
     lastTransportState = null
     regrouped = false
     return ++epoch
@@ -134,6 +139,7 @@ class RendererSession(
     mutex.withLock {
       if (generation < latestRequested) return superseded(generation)
       activeGeneration = generation
+      nextUri = null
       val control = avTransport ?: refreshControlUrl() ?: return LoadResult(false, "unreachable", generation, "")
 
       stopBeforeHandover(control)
@@ -164,6 +170,29 @@ class RendererSession(
     }
 
   private fun superseded(generation: Double) = LoadResult(false, "superseded", generation, "")
+
+  data class NextResult(val ok: Boolean, val errorCode: Int?)
+
+  /**
+   * Queues the track after this one on the renderer, which then starts it on its
+   * own when the current one ends: the phone may be frozen in the background by
+   * then. Only for the load that is current, so a slow call cannot queue behind a
+   * track that has since been replaced.
+   */
+  suspend fun setNext(track: Track, generation: Double): NextResult = mutex.withLock {
+    if (generation != activeGeneration || generation < latestRequested) return NextResult(false, null)
+    val control = avTransport ?: refreshControlUrl() ?: return NextResult(false, null)
+    val result = Soap.call(
+      control,
+      Services.AV_TRANSPORT,
+      "SetNextAVTransportURI",
+      "<InstanceID>0</InstanceID>" +
+        "<NextURI>${Soap.escape(track.url)}</NextURI>" +
+        "<NextURIMetaData>${Soap.escape(Didl.forTrack(track))}</NextURIMetaData>"
+    )
+    nextUri = if (result.ok) track.url else null
+    NextResult(result.ok, result.errorCode)
+  }
 
   private suspend fun stopBeforeHandover(control: String, force: Boolean = false) {
     val idle = lastTransportState == "STOPPED" || lastTransportState == "NO_MEDIA_PRESENT"
@@ -465,6 +494,11 @@ class RendererSession(
       }
     }
     lastTransportState = playbackState
+    val next = nextUri
+    if (next != null && trackUri.isNotEmpty() && StreamUri.same(trackUri, next)) {
+      lastUri = next
+      nextUri = null
+    }
     return State(
       playbackState = playbackState,
       transportStatus = Soap.argument(transport.body, "CurrentTransportStatus") ?: "OK",

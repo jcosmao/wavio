@@ -131,6 +131,17 @@ type UpnpCastNativeModule = {
     generation: number,
   ): Promise<UpnpLoadResult>;
   /**
+   * Queues the track after the current one with SetNextAVTransportURI, so the
+   * renderer starts it on its own. Only applies to the load `generation` names.
+   * `errorCode` is the UPnP fault code when the renderer refused (401: no such
+   * action).
+   */
+  setNext(
+    url: string,
+    track: UpnpTrackInfo,
+    generation: number,
+  ): Promise<{ ok: boolean; errorCode: number | null }>;
+  /**
    * `resumeAtMs` > 0 seeks there once the renderer reports PLAYING — the way to
    * resume on one that stopped instead of pausing and would otherwise start over.
    */

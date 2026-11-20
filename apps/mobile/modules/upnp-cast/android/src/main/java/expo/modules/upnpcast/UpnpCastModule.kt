@@ -35,7 +35,17 @@ class TrackInfo(
   /** Only when it is an address the renderer itself can reach. */
   @Field val artworkUrl: String? = null,
   @Field val durationSec: Double? = null
-) : Record
+) : Record {
+  fun toTrack(url: String) = Track(
+    url = url,
+    mime = mime,
+    title = title,
+    artist = artist,
+    album = album,
+    artworkUrl = artworkUrl,
+    durationSeconds = (durationSec ?: 0.0).toInt()
+  )
+}
 
 /**
  * UPnP/DLNA casting: finds renderers on the local network and drives playback over
@@ -236,15 +246,7 @@ class UpnpCastModule : Module() {
       )
       scope.launch {
         val result = current.load(
-          Track(
-            url = url,
-            mime = track.mime,
-            title = track.title,
-            artist = track.artist,
-            album = track.album,
-            artworkUrl = track.artworkUrl,
-            durationSeconds = (track.durationSec ?: 0.0).toInt()
-          ),
+          track.toTrack(url),
           autoplay,
           startPositionMs.toLong(),
           generation
@@ -254,6 +256,19 @@ class UpnpCastModule : Module() {
           "#${generation.toInt()} -> ok=${result.ok} reason=${result.reason} holding=${result.trackUri}"
         )
         promise.resolve(loadResultMap(result))
+      }
+    }
+
+    AsyncFunction("setNext") { url: String, track: TrackInfo, generation: Double, promise: Promise ->
+      val current = session
+      if (current == null) {
+        promise.resolve(mapOf("ok" to false, "errorCode" to null))
+        return@AsyncFunction
+      }
+      scope.launch {
+        val result = current.setNext(track.toTrack(url), generation)
+        UpnpTrace.record("NEXT", "#${generation.toInt()} -> ok=${result.ok} error=${result.errorCode}\n  $url")
+        promise.resolve(mapOf("ok" to result.ok, "errorCode" to result.errorCode))
       }
     }
 
